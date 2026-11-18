@@ -1,0 +1,150 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+
+# MediaPipe 초기화
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+
+def calculate_angle(a, b, c):
+    """
+    세 점(a: 어깨, b: 팔꿈치, c: 손목)의 2D 좌표를 받아 팔꿈치 관절 각도를 계산합니다.
+    """
+    a = np.array(a)  # Shoulder
+    b = np.array(b)  # Elbow
+    c = np.array(c)  # Wrist
+
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+
+    if angle > 180.0:
+        angle = 360.0 - angle
+
+    return angle
+
+def main():
+    # 웹캠 연결 (기본 카메라: 0)
+    cap = cv2.VideoCapture(0)
+
+    # 운동 카운터 변수
+    counter = 0
+    stage = None  # "down" 또는 "up"
+    feedback = "Ready"
+
+    # 각도 임계값 설정 (개인 가동범위에 맞게 조절 가능)
+    UP_ANGLE = 40    # 팔을 완전히 수축했을 때의 각도
+    DOWN_ANGLE = 160 # 팔을 완전히 이완했을 때의 각도
+
+    with mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6) as pose:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("웹캠 피드를 읽을 수 없습니다.")
+                break
+
+            # 좌우 반전 (거울 모드)
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+
+            # BGR -> RGB 색상 공간 변환
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_image.flags.writeable = False
+
+            # 포즈 추론 수행
+            results = pose.process(rgb_image)
+
+            # 렌더링을 위해 다시 BGR 변환
+            rgb_image.flags.writeable = True
+            image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+
+            angle = 0
+            per = 0
+            bar = 400
+
+            if results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+
+                try:
+                    # 오른쪽 팔 랜드마크 추출 (필요 시 LEFT_... 로 변경 가능)
+                    shoulder = [
+                        landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * w,
+                        landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * h
+                    ]
+                    elbow = [
+                        landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x * w,
+                        landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y * h
+                    ]
+                    wrist = [
+                        landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x * w,
+                        landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y * h
+                    ]
+
+                    # 팔꿈치 각도 계산
+                    angle = calculate_angle(shoulder, elbow, wrist)
+
+                    # 진행률(%) 및 진행 바 좌표 계산 (이완: 160도 -> 0%, 수축: 40도 -> 100%)
+                    per = np.interp(angle, (UP_ANGLE, DOWN_ANGLE), (100, 0))
+                    bar = np.interp(angle, (UP_ANGLE, DOWN_ANGLE), (100, 400))
+
+                    # 이두 컬 카운트 로직
+                    if angle > DOWN_ANGLE:
+                        stage = "DOWN"
+                        feedback = "Curl Up"
+                    if angle < UP_ANGLE and stage == "DOWN":
+                        stage = "UP"
+                        counter += 1
+                        feedback = "Good Rep!"
+
+                    # 관절 위치에 각도 텍스트 시각화
+                    cv2.putText(image, f"{int(angle)} deg", 
+                                tuple(np.multiply(elbow, [1, 1]).astype(int)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+                except Exception as e:
+                    pass
+
+                # 관절 스켈레톤 라인 렌더링
+                mp_drawing.draw_landmarks(
+                    image, 
+                    results.pose_landmarks, 
+                    mp_pose.POSE_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
+                    mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
+                )
+
+            # ================= UI 디자인 렌더링 =================
+            # 1. 상단 대시보드 상태 박스 (반투명 바 느낌의 배경)
+            cv2.rectangle(image, (0, 0), (w, 85), (35, 35, 35), -1)
+            cv2.line(image, (0, 85), (w, 85), (0, 255, 200), 2)
+
+            # 2. REPS (카운트) 표시
+            cv2.putText(image, 'REPS', (25, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(image, str(counter), (25, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3, cv2.LINE_AA)
+
+            # 3. STAGE (동작 단계) 표시
+            cv2.putText(image, 'STAGE', (160, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            stage_text = stage if stage else "--"
+            cv2.putText(image, stage_text, (160, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
+
+            # 4. FEEDBACK 표시
+            cv2.putText(image, 'FEEDBACK', (320, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(image, feedback, (320, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # 5. 우측 수축 진행 바 (Progress Bar)
+            bar_color = (0, 255, 0) if per >= 95 else (0, 165, 255)
+            cv2.rectangle(image, (w - 60, 100), (w - 25, 400), (80, 80, 80), 2)
+            cv2.rectangle(image, (w - 60, int(bar)), (w - 25, 400), bar_color, -1)
+            cv2.putText(image, f'{int(per)}%', (w - 75, 435), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # 화면 출력
+            cv2.imshow('Bicep Curl Counter UI', image)
+
+            # 'q' 키를 누르면 종료
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
